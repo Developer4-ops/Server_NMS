@@ -1,6 +1,6 @@
-# app/main.py
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Any, Dict
+import asyncio
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -17,6 +17,7 @@ from sqlalchemy.future import select
 # Configuration
 # -----------------------
 DATABASE_URL = "postgresql+asyncpg://nms_server:server@localhost:5432/nms_db"
+OFFLINE_THRESHOLD_SECONDS = 300 # 5 minutes
 
 engine = create_async_engine(DATABASE_URL, echo=True)
 async_session = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
@@ -199,14 +200,9 @@ class CollectMetricsPayload(BaseModel):
 # Helpers
 # -----------------------
 def parse_timestamp(ts: Optional[str]) -> datetime:
-    if not ts:
-        return datetime.now(timezone.utc)
-    try:
-        iso = ts.replace("Z", "+00:00")
-        return datetime.fromisoformat(iso).astimezone(timezone.utc)
-    except Exception:
-        return datetime.now(timezone.utc)
-
+    # --- FIX: ALWAYS USE SERVER'S CURRENT UTC TIME TO PREVENT CLOCK DRIFT ISSUES ---
+    return datetime.now(timezone.utc)
+    # --- END FIX ---
 
 def row_to_dict(instance: Any) -> Dict[str, Any]:
     if instance is None:
@@ -221,8 +217,54 @@ def row_to_dict(instance: Any) -> Dict[str, Any]:
     return out
 
 # -----------------------
+# Background Tasks
+# -----------------------
+offline_task = None 
+
+async def offline_checker():
+   """ Periodically checks for devices that haven't sent metrics recently."""
+    while True:
+        await asyncio.sleep(60) # Run every 60 seconds
+        print("Running offline checker...")
+
+        try:
+            async with async_session() as db:
+                # Calculate the timestamp (e.g., 5 minutes ago)
+                cutoff_time = datetime.now(timezone.utc) - timedelta(seconds=OFFLINE_THRESHOLD_SECONDS)
+
+                # Select devices that are currently 'online' but their last_seen is older than the cutoff
+                result = await db.execute(
+                    select(Device)
+                    .where(
+                        Device.status == "online",
+                        Device.last_seen < cutoff_time
+                    )
+                )
+                devices_to_update = result.scalars().all()
+
+                for device in devices_to_update:
+                    device.status = "offline"
+                    print(f"Device {device.ip_address} is now OFFLINE.")
+                    db.add(device)
+
+                if devices_to_update:
+                    await db.commit()
+
+        except Exception as e:
+            print(f"Error during offline checker: {e}")
+
+
+# -----------------------
 # API Endpoints
 # -----------------------
+
+# FIX: Add a root path to resolve the 404 Not Found log
+@app.get("/")
+async def read_root():
+   """ A simple welcome message for the root URL.
+    return {"message": "Welcome to the Server NMS API. Access documentation at /docs."}"""
+
+
 @app.post("/devices/", response_model=DeviceResponse)
 async def create_device(device: DeviceCreate):
     async with async_session() as db:
@@ -255,7 +297,8 @@ async def collect_metrics(payload: CollectMetricsPayload):
             raise HTTPException(status_code=404, detail="Device not found")
 
         device_id = device.id
-        ts = parse_timestamp(payload.timestamp)
+        # Call the updated helper, which now uses server's current UTC time
+        ts = parse_timestamp(payload.timestamp) 
 
         # Insert metrics
         db.add(CpuMetric(device_id=device_id, timestamp=ts, **payload.cpu.dict()))
@@ -276,9 +319,14 @@ async def collect_metrics(payload: CollectMetricsPayload):
     return {"detail": "Metrics collected successfully"}
 
 
+# ... (Keep all preceding code and imports unchanged) ...
+
+# ... (Keep all preceding code and imports unchanged) ...
+
 @app.get("/devices/{ip_address}/metrics")
 async def get_device_metrics(ip_address: str):
-    """Return latest metrics for a device identified by IP."""
+    Return latest metrics for a device identified by IP. 
+    (Now returns only the metrics data for a cleaner response)
     async with async_session() as db:
         result = await db.execute(select(Device).where(Device.ip_address == ip_address))
         device = result.scalars().first()
@@ -307,6 +355,7 @@ async def get_device_metrics(ip_address: str):
 
         # Latest Disk metrics
         disk_list = []
+        # Query distinct mount points
         mounts = (
             await db.execute(
                 select(DiskMetric.mount_point)
@@ -316,6 +365,7 @@ async def get_device_metrics(ip_address: str):
         ).scalars().all()
 
         for mount in mounts:
+            # Get the single latest metric for each mount point
             disk_item = (
                 await db.execute(
                     select(DiskMetric)
@@ -328,6 +378,7 @@ async def get_device_metrics(ip_address: str):
 
         # Latest Network metrics
         network_list = []
+        # Query distinct interface names
         interfaces = (
             await db.execute(
                 select(NetworkMetric.interface_name)
@@ -337,6 +388,7 @@ async def get_device_metrics(ip_address: str):
         ).scalars().all()
 
         for iface in interfaces:
+            # Get the single latest metric for each interface
             net_item = (
                 await db.execute(
                     select(NetworkMetric)
@@ -347,17 +399,34 @@ async def get_device_metrics(ip_address: str):
             if net_item:
                 network_list.append(row_to_dict(net_item))
 
+        # --- THE ONLY CHANGE IS HERE ---
+        # Instead of returning {"device": ..., "metrics": ...}, we return only the metrics block.
         return {
-            "device": {
-                "id": device.id,
-                "hostname": device.hostname,
-                "ip_address": str(device.ip_address),
-                "status": device.status,
-            },
-            "metrics": {
-                "cpu": row_to_dict(cpu) if cpu else None,
-                "memory": row_to_dict(memory) if memory else None,
-                "disk": disk_list,
-                "network": network_list,
-            },
+            "cpu": row_to_dict(cpu) if cpu else None,
+            "memory": row_to_dict(memory) if memory else None,
+            "disk": disk_list,
+            "network": network_list,
         }
+        # --- END OF CHANGE ---
+
+# ... (Keep all subsequent code unchanged) ...
+
+# ... (Keep all subsequent code unchanged) ...
+
+# -----------------------
+# Startup/Shutdown Events
+# -----------------------
+@app.on_event("startup")
+async def startup_event():
+    global offline_task
+    # Launch the offline checker in the background
+    offline_task = asyncio.create_task(offline_checker())
+    print("Background offline checker started.")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global offline_task
+    if offline_task:
+        offline_task.cancel()
+        print("Background offline checker stopped.")
